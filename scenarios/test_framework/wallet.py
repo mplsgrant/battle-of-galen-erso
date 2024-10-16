@@ -7,6 +7,7 @@
 from copy import deepcopy
 from decimal import Decimal
 from enum import Enum
+from io import BytesIO
 from typing import (
     Any,
     List,
@@ -32,7 +33,7 @@ from test_framework.messages import (
     CTransaction,
     CTxIn,
     CTxInWitness,
-    CTxOut,
+    CTxOut, from_hex,
 )
 from test_framework.script import (
     CScript,
@@ -49,6 +50,7 @@ from test_framework.script_util import (
     key_to_p2sh_p2wpkh_script,
     key_to_p2wpkh_script,
 )
+from test_framework.test_node import TestNode
 from test_framework.util import (
     assert_equal,
     assert_greater_than_or_equal,
@@ -78,6 +80,7 @@ class MiniWalletMode(Enum):
     ADDRESS_OP_TRUE = 1
     RAW_OP_TRUE = 2
     RAW_P2PK = 3
+    TEST_NODE = 4
 
 
 class MiniWallet:
@@ -98,6 +101,14 @@ class MiniWallet:
         elif mode == MiniWalletMode.ADDRESS_OP_TRUE:
             self._address, self._internal_key = create_deterministic_address_bcrt1_p2tr_op_true()
             self._scriptPubKey = address_to_scriptpubkey(self._address)
+        elif mode == MiniWalletMode.TEST_NODE:
+            wallet_name = "default"
+            maybe_wallets = self._test_node.listwallets()
+            if not maybe_wallets:
+                self._test_node.createwallet(wallet_name)
+            self._priv_key = None
+            self.get_address()
+
 
         # When the pre-mined test framework chain is used, it contains coinbase
         # outputs to the MiniWallet's default address in blocks 76-100
@@ -127,7 +138,19 @@ class MiniWallet:
     def rescan_utxos(self, *, include_mempool=True):
         """Drop all utxos and rescan the utxo set"""
         self._utxos = []
-        res = self._test_node.scantxoutset(action="start", scanobjects=[self.get_descriptor()])
+
+        scan_objects = []
+        if self._mode == MiniWalletMode.TEST_NODE:
+            address_groupings = self._test_node.listaddressgroupings()
+            for group in address_groupings:
+                for address_info in group:
+                    address = address_info[0]
+                    address_details = self._test_node.getaddressinfo(address)
+                    scan_objects.append(address_details["desc"])
+        else:
+            scan_objects = [self.get_descriptor()]
+
+        res = self._test_node.scantxoutset(action="start", scanobjects=scan_objects)
         assert_equal(True, res['success'])
         for utxo in res['unspents']:
             self._utxos.append(
@@ -163,7 +186,7 @@ class MiniWallet:
         for tx in txs:
             self.scan_tx(tx)
 
-    def sign_tx(self, tx, fixed_length=True):
+    def sign_tx(self, tx: CTransaction, fixed_length=True):
         if self._mode == MiniWalletMode.RAW_P2PK:
             # for exact fee calculation, create only signatures with fixed size by default (>49.89% probability):
             # 65 bytes: high-R val (33 bytes) + low-S val (32 bytes)
@@ -182,6 +205,16 @@ class MiniWallet:
             tx.wit.vtxinwit = [CTxInWitness()] * len(tx.vin)
             for i in tx.wit.vtxinwit:
                 i.scriptWitness.stack = [CScript([OP_TRUE]), bytes([LEAF_VERSION_TAPSCRIPT]) + self._internal_key]
+        elif self._mode == MiniWalletMode.TEST_NODE:
+            tx_hex = tx.serialize_with_witness().hex()
+            signed_tx_hex = self._test_node.signrawtransactionwithwallet(tx_hex)["hex"]
+            signed_tx = from_hex(CTransaction(), signed_tx_hex)
+
+            tx.vin = signed_tx.vin
+            tx.vout = signed_tx.vout
+            tx.wit = signed_tx.wit  # Witness data
+            tx.nLockTime = signed_tx.nLockTime
+            tx.nVersion = signed_tx.nVersion
         else:
             assert False
 
@@ -202,11 +235,22 @@ class MiniWallet:
         return self._scriptPubKey
 
     def get_descriptor(self):
-        return descsum_create(f'raw({self._scriptPubKey.hex()})')
+        if self._mode == MiniWalletMode.TEST_NODE:
+            address_info = self._test_node.getaddressinfo(self._address)
+            descriptor = self._test_node.getdescriptorinfo(address_info["desc"])
+            return descriptor["descriptor"]
+        else:
+            return descsum_create(f'raw({self._scriptPubKey.hex()})')
 
     def get_address(self):
-        assert_equal(self._mode, MiniWalletMode.ADDRESS_OP_TRUE)
-        return self._address
+        if self._mode == MiniWalletMode.TEST_NODE:
+            self._address = self._test_node.getnewaddress()
+            address_info = self._test_node.getaddressinfo(self._address)
+            self._scriptPubKey = address_info["scriptPubKey"]
+            return self._address
+        else:
+            assert_equal(self._mode, MiniWalletMode.ADDRESS_OP_TRUE)
+            return self._address
 
     def get_utxo(self, *, txid: str = '', vout: Optional[int] = None, mark_as_spent=True, confirmed_only=False) -> dict:
         """
@@ -234,6 +278,10 @@ class MiniWallet:
 
     def get_utxos(self, *, include_immature_coinbase=False, mark_as_spent=True, confirmed_only=False):
         """Returns the list of all utxos and optionally mark them as spent"""
+        if self._mode == MiniWalletMode.TEST_NODE:
+            if mark_as_spent:
+                self._utxos = []
+            return self._test_node.listunspent(1 if confirmed_only else 0)
         if not include_immature_coinbase:
             blocks_height = self._test_node.getblockchaininfo()['blocks']
             utxo_filter = filter(lambda utxo: not utxo['coinbase'] or COINBASE_MATURITY - 1 <= blocks_height - utxo['height'], self._utxos)
@@ -356,6 +404,12 @@ class MiniWallet:
             vsize = Decimal(104)  # anyone-can-spend
         elif self._mode == MiniWalletMode.RAW_P2PK:
             vsize = Decimal(168)  # P2PK (73 bytes scriptSig + 35 bytes scriptPubKey + 60 bytes other)
+        elif self._mode == MiniWalletMode.TEST_NODE:
+            temp_tx = self.create_self_transfer_multi(utxos_to_spend=[utxo_to_spend], locktime=locktime,
+                                                 sequence=sequence,
+                                                 amount_per_output=int(COIN * utxo_to_spend["value"]),
+                                                 target_weight=target_weight)
+            vsize = self._test_node.decoderawtransaction(temp_tx.serialize().hex())["vsize"]
         else:
             assert False
         send_value = utxo_to_spend["value"] - (fee or (fee_rate * vsize / 1000))
